@@ -6,12 +6,12 @@ use std::process::Command;
 struct Config {
     netdatafrom: String,
     avoidfrom: Vec<String>,
-    action: String, // "connectvpn", "disconnectvpn", "kill"
+    action: String,
 }
 
 fn usage() -> ! {
     eprintln!("Usage:");
-    eprintln!("  ikev2_localpipe --netdatafrom <IP:PORT> [--avoidfrom <IP|IP:PORT|...>] <connectvpn|disconnectvpn|kill>");
+    eprintln!("  ikev2_localpipe --netdatafrom <IP[:PORT]> [--avoidfrom <IP|IP:PORT|...>] <connectvpn|disconnectvpn|kill>");
     std::process::exit(1);
 }
 
@@ -62,13 +62,13 @@ fn parse_args() -> Config {
     }
 
     if netdatafrom.is_empty() && action == "connectvpn" {
-        netdatafrom = ask("Enter --netdatafrom (IP:PORT): ");
+        netdatafrom = ask("Enter --netdatafrom (IP[:PORT]): ");
     }
-    // Only ask avoidfrom if it's still empty
     if avoidfrom.is_empty() && action == "connectvpn" {
         let a = ask("Enter --avoidfrom (optional, multiple with |): ");
         if !a.is_empty() {
-            avoidfrom = a.split('|')
+            avoidfrom = a
+                .split('|')
                 .map(|s| s.split(':').next().unwrap_or("").to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -79,20 +79,15 @@ fn parse_args() -> Config {
         eprintln!("[ERROR] --netdatafrom is required");
         usage();
     }
-    if !netdatafrom.contains(':') {
-        eprintln!("[ERROR] --netdatafrom must include port");
-        usage();
-    }
     if action.is_empty() {
         eprintln!("[ERROR] You must specify one action: connectvpn, disconnectvpn, or kill");
         usage();
     }
 
-    // Add netdatafrom's IP into avoid list
-    let ip_only = netdatafrom.split(':').next().unwrap().to_string();
-    avoidfrom.push(ip_only);
+    // ensure netdatafrom IP is also in avoid list
+    let nd_ip = netdatafrom.split(':').next().unwrap().to_string();
+    avoidfrom.push(nd_ip);
 
-    // Deduplicate & sort
     avoidfrom.sort();
     avoidfrom.dedup();
 
@@ -164,13 +159,15 @@ async fn handle_linux(cfg: &Config) {
 
             let mut ipv4 = HashMap::new();
             ipv4.insert("never-default", Value::from(true));
-            let routes: Vec<String> = cfg
-                .avoidfrom
-                .iter()
-                .map(|ip| format!("{}/32", ip))
-                .collect();
-            ipv4.insert("routes", Value::from(routes));
+            let routes4: Vec<String> = cfg.avoidfrom.iter().map(|ip| format!("{}/32", ip)).collect();
+            ipv4.insert("routes", Value::from(routes4));
             con.insert("ipv4", ipv4);
+
+            let mut ipv6 = HashMap::new();
+            ipv6.insert("never-default", Value::from(true));
+            let routes6: Vec<String> = cfg.avoidfrom.iter().map(|ip| format!("{}/128", ip)).collect();
+            ipv6.insert("routes", Value::from(routes6));
+            con.insert("ipv6", ipv6);
 
             match nm.call::<OwnedObjectPath>("AddConnection", &(con)).await {
                 Ok(path) => {
@@ -281,18 +278,31 @@ fn handle_windows(cfg: &Config) {
         "connectvpn" => {
             run_command(&mut Command::new("powershell")
                 .arg("-Command")
-                .arg(format!("rasdial {} 12", name)), "Windows start VPN");
+                .arg(format!("Add-VpnConnection -Name '{name}' -ServerAddress 'localhost' -TunnelType IKEv2 -SplitTunneling -Force")), "Windows create VPN connection");
+            for ip in &cfg.avoidfrom {
+                run_command(&mut Command::new("powershell")
+                    .arg("-Command")
+                    .arg(format!("Add-VpnConnectionRoute -ConnectionName '{name}' -DestinationPrefix '{ip}/32' -PassThru")), "Windows route avoid IPv4");
+                run_command(&mut Command::new("powershell")
+                    .arg("-Command")
+                    .arg(format!("Add-VpnConnectionRoute -ConnectionName '{name}' -DestinationPrefix '{ip}/128' -PassThru")), "Windows route avoid IPv6");
+            }
+            run_command(&mut Command::new("powershell")
+                .arg("-Command")
+                .arg(format!("rasdial {name} 12")), "Windows dial VPN");
         }
         "disconnectvpn" => {
             run_command(&mut Command::new("powershell")
                 .arg("-Command")
-                .arg(format!("rasdial {} /disconnect", name)), "Windows stop VPN");
+                .arg(format!("rasdial {name} /disconnect")), "Windows disconnect VPN");
         }
         "kill" => {
             run_command(&mut Command::new("powershell")
                 .arg("-Command")
-                .arg(format!("Remove-VpnConnection -Name '{}' -Force -PassThru", name)),
-                "Windows delete VPN config");
+                .arg(format!("rasdial {name} /disconnect")), "Windows disconnect VPN");
+            run_command(&mut Command::new("powershell")
+                .arg("-Command")
+                .arg(format!("Remove-VpnConnection -Name '{name}' -Force -PassThru")), "Windows delete VPN connection");
         }
         _ => usage(),
     }
